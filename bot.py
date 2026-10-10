@@ -46,6 +46,9 @@ default_playlist: Optional[str] = None  # playlist ID
 pending_thumbnail: dict = {}  # chat_id -> video_id waiting for thumbnail
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
+PARALLEL_WORKERS = 8  # number of parallel download connections
+PARALLEL_CHUNK = 512 * 1024  # 512KB per request (Telegram max)
+PARALLEL_THRESHOLD = 100 * 1024 * 1024  # use parallel for files > 100 MB
 
 CATEGORY_MAP = {
     "1": "Film & Animation", "2": "Autos & Vehicles",
@@ -297,7 +300,7 @@ def upload_to_youtube_with_progress(
     }
 
     file_size = os.path.getsize(path)
-    chunk_size = 8 * 1024 * 1024  # 8 MB
+    chunk_size = 100 * 1024 * 1024  # 100 MB chunks for faster upload (was 8 MB)
     media = MediaFileUpload(path, chunksize=chunk_size, resumable=True)
     request = youtube.videos().insert(
         part="snippet,status", body=body, media_body=media
@@ -379,6 +382,90 @@ def upload_captions(video_id: str, caption_path: str, language: str = "en", name
 
 
 # ======================================================================
+#  Parallel download from Telegram
+# ======================================================================
+
+async def parallel_download(
+    tg_client: TelegramClient,
+    document,
+    dest_path: str,
+    file_size: int,
+    workers: int = PARALLEL_WORKERS,
+    progress_callback=None,
+):
+    """
+    Download a Telegram document using multiple parallel connections.
+    Each worker downloads non-overlapping chunks using iter_download
+    with offset/stride, and writes them directly to the target file.
+    """
+    from telethon.utils import get_input_location
+
+    dc_id, input_location = get_input_location(document)
+    chunk_size = PARALLEL_CHUNK  # 512KB per request
+    # Each worker's stride = workers * chunk_size (interleaved)
+    stride = workers * chunk_size
+
+    # Shared progress state
+    progress_lock = asyncio.Lock()
+    worker_bytes = [0] * workers
+
+    # Pre-allocate file so workers can open it in r+b mode and seek
+    with open(dest_path, "wb") as f:
+        if file_size > 0:
+            f.seek(file_size - 1)
+            f.write(b"\0")
+
+    async def _worker(worker_id: int):
+        """Download this worker's portion of the file."""
+        offset = worker_id * chunk_size
+        bytes_downloaded = 0
+        iteration = 0
+        # r+b allows writing to specific offsets without truncating
+        with open(dest_path, "r+b") as f:
+            async for chunk in tg_client.iter_download(
+                document,
+                offset=offset,
+                stride=stride,
+                request_size=chunk_size,
+                file_size=file_size,
+                dc_id=dc_id,
+            ):
+                write_offset = offset + iteration * stride
+                f.seek(write_offset)
+                f.write(chunk)
+                
+                bytes_downloaded += len(chunk)
+                iteration += 1
+                
+                if progress_callback:
+                    async with progress_lock:
+                        worker_bytes[worker_id] = bytes_downloaded
+                        total_done = sum(worker_bytes)
+                        await progress_callback(total_done, file_size)
+
+    tasks = []
+    for i in range(workers):
+        tasks.append(asyncio.create_task(_worker(i)))
+
+    try:
+        await asyncio.gather(*tasks)
+    except Exception:
+        # Cancel remaining tasks on failure
+        for t in tasks:
+            t.cancel()
+        raise
+    finally:
+        # Wait for cancellations to complete
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    log.info(
+        f"Parallel download complete: {file_size / (1024*1024):.1f} MB "
+        f"with {workers} workers"
+    )
+    return dest_path
+
+
+# ======================================================================
 #  Core upload flow
 # ======================================================================
 
@@ -398,9 +485,31 @@ async def _do_upload(item: QueueItem):
         async def dl_progress(received, total):
             await dl_tracker.update(received, total or total_size)
 
-        path = await event.download_media(
-            file=tmpdir, progress_callback=dl_progress
-        )
+        use_parallel = event.document and total_size > PARALLEL_THRESHOLD
+
+        if use_parallel:
+            # Determine filename from document attributes
+            filename = "video"
+            for attr in event.document.attributes:
+                if isinstance(attr, DocumentAttributeFilename):
+                    filename = attr.file_name
+                    break
+            dest_path = os.path.join(tmpdir, filename)
+            workers = min(PARALLEL_WORKERS, max(2, total_size // (50 * 1024 * 1024)))
+            await status.edit(f"⬇️ Downloading… ({workers} connections)")
+            dl_tracker = ProgressTracker(status, f"⬇️ Downloading… ({workers}x)")
+            path = await parallel_download(
+                tg_client=client,
+                document=event.document,
+                dest_path=dest_path,
+                file_size=total_size,
+                workers=workers,
+                progress_callback=dl_progress,
+            )
+        else:
+            path = await event.download_media(
+                file=tmpdir, progress_callback=dl_progress
+            )
         await status.edit("⬆️ Uploading to YouTube…")
 
         # ---- Upload with retry ----
