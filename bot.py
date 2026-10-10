@@ -46,7 +46,7 @@ default_playlist: Optional[str] = None  # playlist ID
 pending_thumbnail: dict = {}  # chat_id -> video_id waiting for thumbnail
 MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
-PARALLEL_WORKERS = 8  # number of parallel download connections
+PARALLEL_WORKERS = 16  # number of parallel download connections
 PARALLEL_CHUNK = 512 * 1024  # 512KB per request (Telegram max)
 PARALLEL_THRESHOLD = 100 * 1024 * 1024  # use parallel for files > 100 MB
 
