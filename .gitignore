@@ -1,0 +1,8 @@
+.env
+token.json
+client_secret.json
+ytbot.session
+upload_history.json
+venv/
+__pycache__/
+*.pyc
