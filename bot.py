@@ -184,20 +184,82 @@ class ProgressTracker:
         self.min_interval = min_interval
         self._last_update = 0.0
         self._last_text = ""
+        self._start_time: Optional[float] = None
+        self._samples: list[tuple[float, int]] = []  # (timestamp, bytes) for speed calc
+
+    @staticmethod
+    def _fmt_time(seconds: float) -> str:
+        """Format seconds into a human-readable string."""
+        if seconds < 0:
+            return "—"
+        seconds = int(seconds)
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, secs = divmod(seconds, 60)
+        if minutes < 60:
+            return f"{minutes}m {secs:02d}s"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}h {minutes:02d}m"
+
+    @staticmethod
+    def _fmt_speed(bps: float) -> str:
+        """Format bytes/sec into a human-readable string."""
+        if bps <= 0:
+            return "— MB/s"
+        mbs = bps / (1024 * 1024)
+        if mbs >= 1:
+            return f"{mbs:.1f} MB/s"
+        kbs = bps / 1024
+        return f"{kbs:.0f} KB/s"
 
     async def update(self, current: int, total: int):
         now = time.time()
+
+        # Initialise start time on first call
+        if self._start_time is None:
+            self._start_time = now
+
+        # Keep a rolling window of samples (last 10s) for speed calc
+        self._samples.append((now, current))
+        cutoff = now - 10.0
+        self._samples = [(t, b) for t, b in self._samples if t >= cutoff]
+
+        # Throttle edits
         if now - self._last_update < self.min_interval:
             return
         if total <= 0:
             return
+
         pct = min(current / total * 100, 100)
         bar_len = 14
         filled = int(bar_len * pct / 100)
         bar = "█" * filled + "░" * (bar_len - filled)
         mb_done = current / (1024 * 1024)
         mb_total = total / (1024 * 1024)
-        text = f"{self.prefix}\n{bar} {pct:.0f}%\n{mb_done:.1f} / {mb_total:.1f} MB"
+
+        elapsed = now - self._start_time
+
+        # Speed from rolling window
+        if len(self._samples) >= 2:
+            dt = self._samples[-1][0] - self._samples[0][0]
+            db = self._samples[-1][1] - self._samples[0][1]
+            speed = db / dt if dt > 0 else 0
+        else:
+            speed = current / elapsed if elapsed > 0 else 0
+
+        # ETA
+        remaining_bytes = total - current
+        eta = remaining_bytes / speed if speed > 0 else -1
+
+        text = (
+            f"{self.prefix}\n"
+            f"{bar} {pct:.0f}%\n"
+            f"{mb_done:.1f} / {mb_total:.1f} MB\n"
+            f"Elapsed: {self._fmt_time(elapsed)}\n"
+            f"ETA: {self._fmt_time(eta)}\n"
+            f"Speed: {self._fmt_speed(speed)}"
+        )
+
         if text == self._last_text:
             return
         try:
