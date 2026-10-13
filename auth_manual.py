@@ -2,7 +2,10 @@ import os
 from google_auth_oauthlib.flow import Flow
 
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+SCOPES = [
+    "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube.force-ssl",
+]
 
 flow = Flow.from_client_secrets_file(
     "client_secret.json", SCOPES, redirect_uri="http://localhost:8080/"
