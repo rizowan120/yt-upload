@@ -1,251 +1,133 @@
 import asyncio
-import json
 import logging
 import os
 import re
 import tempfile
 import time
-from collections import deque
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from dotenv import load_dotenv
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.tl.types import DocumentAttributeFilename
 
-# ---- Load .env ----
-load_dotenv()
+import state
+from state import (
+    API_ID,
+    API_HASH,
+    BOT_TOKEN,
+    OWNER_ID,
+    SESSION_FILE,
+    MAX_DOWNLOAD_GB,
+    DOWNLOAD_DIR,
+    CATEGORY_MAP,
+    JobState,
+    create_job,
+    get_job,
+    get_waiting_title_job,
+)
+from downloader import (
+    clean_title,
+    extract_url,
+    is_host_allowed,
+    inspect_url,
+    check_disk_space,
+    format_size,
+    format_time,
+    format_speed,
+    download_url_stream,
+    download_tg_video,
+)
+from youtube import (
+    upload_to_youtube_with_progress,
+    save_history,
+    add_to_playlist,
+    set_thumbnail,
+    upload_captions,
+)
 
-# ---- Logging ----
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("ytbot")
 
-# ---- Config ----
-API_ID = int(os.environ["API_ID"])
-API_HASH = os.environ["API_HASH"]
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID = int(os.environ["OWNER_ID"])
-TOKEN_FILE = "token.json"
-SCOPES = [
-    "https://www.googleapis.com/auth/youtube.upload",
-    "https://www.googleapis.com/auth/youtube.force-ssl",
-]
-HISTORY_FILE = "upload_history.json"
-
-# ---- Per-user state (single owner) ----
-privacy = os.environ.get("PRIVACY", "private")  # private | unlisted | public
-default_tags: list[str] = []
-default_category: str = "22"  # "People & Blogs"
-default_playlist: Optional[str] = None  # playlist ID
-pending_thumbnail: dict = {}  # chat_id -> video_id waiting for thumbnail
-MAX_RETRIES = 3
-RETRY_DELAY = 5  # seconds
-PARALLEL_WORKERS = 16  # number of parallel download connections
-PARALLEL_CHUNK = 512 * 1024  # 512KB per request (Telegram max)
-PARALLEL_THRESHOLD = 100 * 1024 * 1024  # use parallel for files > 100 MB
-
-CATEGORY_MAP = {
-    "1": "Film & Animation", "2": "Autos & Vehicles",
-    "10": "Music", "15": "Pets & Animals",
-    "17": "Sports", "18": "Short Movies",
-    "19": "Travel & Events", "20": "Gaming",
-    "21": "Videoblogging", "22": "People & Blogs",
-    "23": "Comedy", "24": "Entertainment",
-    "25": "News & Politics", "26": "Howto & Style",
-    "27": "Education", "28": "Science & Technology",
-    "29": "Nonprofits & Activism",
-}
-
-client = TelegramClient("ytbot", API_ID, API_HASH)
+# Initialize Telethon client
+client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
 
 
 # ======================================================================
-#  YouTube credentials
+#  Card buttons & text helpers
 # ======================================================================
 
-def get_credentials() -> Credentials:
-    """Load and refresh YouTube OAuth credentials."""
-    if not Path(TOKEN_FILE).exists():
-        raise FileNotFoundError(
-            f"{TOKEN_FILE} not found. Run auth.py or auth_manual.py first."
-        )
-    creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-    if not creds.valid:
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-            Path(TOKEN_FILE).write_text(creds.to_json())
-            log.info("Refreshed YouTube token")
-        else:
-            raise RuntimeError("YouTube token is invalid and cannot be refreshed.")
-    return creds
+def make_preview_buttons(job_id: str):
+    return [
+        [
+            Button.inline("⬇️ Download", data=f"dl:{job_id}"),
+            Button.inline("❌ Cancel", data=f"cancel:{job_id}"),
+        ]
+    ]
 
 
-def get_youtube():
-    """Build an authenticated YouTube API service."""
-    return build("youtube", "v3", credentials=get_credentials())
+def make_ready_buttons(job_id: str, privacy: str):
+    return [
+        [
+            Button.inline("✏️ Title", data=f"title:{job_id}"),
+            Button.inline(f"🔒 {privacy.title()}", data=f"priv:{job_id}"),
+        ],
+        [
+            Button.inline("🚀 Upload", data=f"up:{job_id}"),
+            Button.inline("❌ Cancel", data=f"cancel:{job_id}"),
+        ],
+    ]
 
 
-# ======================================================================
-#  Upload history
-# ======================================================================
-
-def save_history(entry: dict):
-    """Append an upload record to the history file."""
-    history = []
-    if Path(HISTORY_FILE).exists():
-        try:
-            history = json.loads(Path(HISTORY_FILE).read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-    history.append(entry)
-    Path(HISTORY_FILE).write_text(json.dumps(history, indent=2))
+def make_cancel_button(job_id: str):
+    return [[Button.inline("❌ Cancel", data=f"cancel:{job_id}")]]
 
 
-# ======================================================================
-#  Upload queue
-# ======================================================================
-
-@dataclass
-class QueueItem:
-    event: object
-    title: str
-    description: str
-    tags: list[str] = field(default_factory=list)
-    category: str = "22"
-    playlist_id: Optional[str] = None
-
-
-upload_queue: deque[QueueItem] = deque()
-queue_lock = asyncio.Lock()
-queue_running = False
-
-
-async def process_queue():
-    """Process queued uploads one at a time."""
-    global queue_running
-    async with queue_lock:
-        if queue_running:
-            return
-        queue_running = True
-
-    try:
-        while upload_queue:
-            item = upload_queue.popleft()
-            await _do_upload(item)
-    finally:
-        async with queue_lock:
-            queue_running = False
+def render_ready_card_text(job: JobState) -> str:
+    text = (
+        f"📹 **Ready to Upload**\n\n"
+        f"**Title:** {job.title}\n"
+        f"**Size:** {format_size(job.file_size)}\n"
+        f"**Privacy:** {job.privacy}\n\n"
+        f"*(Note: unaudited API projects stay private)*"
+    )
+    if job.waiting_for_title:
+        text += "\n\n✏️ *Send the new title as a message (max 100 characters).*"
+    return text
 
 
 # ======================================================================
-#  Caption parsing
-# ======================================================================
-
-def parse_caption(raw_text: str) -> tuple[str, str, list[str]]:
-    """
-    Parse the message caption.
-      - Line 1 → title
-      - Remaining lines → description
-      - Lines starting with # are extracted as tags
-    Returns (title, description, tags).
-    """
-    text = (raw_text or "").strip()
-    if not text:
-        title = f"Upload {datetime.now():%Y-%m-%d %H:%M}"
-        return title, "", []
-
-    lines = text.split("\n")
-    title = lines[0].strip()
-    rest = "\n".join(lines[1:]).strip()
-
-    # Extract #hashtags as tags
-    tag_pattern = re.compile(r"#(\w+)")
-    inline_tags = tag_pattern.findall(rest)
-    # Remove hashtag lines from description
-    desc_lines = [l for l in rest.split("\n") if not l.strip().startswith("#")]
-    description = "\n".join(desc_lines).strip()
-
-    return title[:100], description, inline_tags
-
-
-# ======================================================================
-#  Progress helpers
+#  Throttled progress tracker (at most once every 3 seconds)
 # ======================================================================
 
 class ProgressTracker:
-    """Throttled progress updater for Telegram status messages."""
-
-    def __init__(self, status_msg, prefix: str, min_interval: float = 3.0):
-        self.status_msg = status_msg
+    def __init__(self, card_msg, job_id: str, prefix: str, min_interval: float = 3.0):
+        self.card_msg = card_msg
+        self.job_id = job_id
         self.prefix = prefix
         self.min_interval = min_interval
         self._last_update = 0.0
         self._last_text = ""
         self._start_time: Optional[float] = None
-        self._samples: list[tuple[float, int]] = []  # (timestamp, bytes) for speed calc
+        self._samples: list[tuple[float, int]] = []
 
-    @staticmethod
-    def _fmt_time(seconds: float) -> str:
-        """Format seconds into a human-readable string."""
-        if seconds < 0:
-            return "—"
-        seconds = int(seconds)
-        if seconds < 60:
-            return f"{seconds}s"
-        minutes, secs = divmod(seconds, 60)
-        if minutes < 60:
-            return f"{minutes}m {secs:02d}s"
-        hours, minutes = divmod(minutes, 60)
-        return f"{hours}h {minutes:02d}m"
-
-    @staticmethod
-    def _fmt_speed(bps: float) -> str:
-        """Format bytes/sec into a human-readable string."""
-        if bps <= 0:
-            return "— MB/s"
-        mbs = bps / (1024 * 1024)
-        if mbs >= 1:
-            return f"{mbs:.1f} MB/s"
-        kbs = bps / 1024
-        return f"{kbs:.0f} KB/s"
-
-    async def update(self, current: int, total: int):
+    async def update(self, current: int, total: int, force: bool = False):
         now = time.time()
-
-        # Initialise start time on first call
         if self._start_time is None:
             self._start_time = now
 
-        # Keep a rolling window of samples (last 10s) for speed calc
         self._samples.append((now, current))
         cutoff = now - 10.0
         self._samples = [(t, b) for t, b in self._samples if t >= cutoff]
 
-        # Throttle edits
-        if now - self._last_update < self.min_interval:
+        if not force and (now - self._last_update < self.min_interval):
             return
-        if total <= 0:
-            return
-
-        pct = min(current / total * 100, 100)
-        bar_len = 14
-        filled = int(bar_len * pct / 100)
-        bar = "█" * filled + "░" * (bar_len - filled)
-        mb_done = current / (1024 * 1024)
-        mb_total = total / (1024 * 1024)
 
         elapsed = now - self._start_time
-
-        # Speed from rolling window
         if len(self._samples) >= 2:
             dt = self._samples[-1][0] - self._samples[0][0]
             db = self._samples[-1][1] - self._samples[0][1]
@@ -253,345 +135,320 @@ class ProgressTracker:
         else:
             speed = current / elapsed if elapsed > 0 else 0
 
-        # ETA
-        remaining_bytes = total - current
-        eta = remaining_bytes / speed if speed > 0 else -1
+        if total > 0:
+            pct = min(current / total * 100, 100)
+            bar_len = 14
+            filled = int(bar_len * pct / 100)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            mb_done = current / (1024 * 1024)
+            mb_total = total / (1024 * 1024)
+            rem = max(0, total - current)
+            eta = rem / speed if speed > 0 else -1
 
-        text = (
-            f"{self.prefix}\n"
-            f"{bar} {pct:.0f}%\n"
-            f"{mb_done:.1f} / {mb_total:.1f} MB\n"
-            f"Elapsed: {self._fmt_time(elapsed)}\n"
-            f"ETA: {self._fmt_time(eta)}\n"
-            f"Speed: {self._fmt_speed(speed)}"
-        )
+            text = (
+                f"{self.prefix}\n\n"
+                f"{bar} {pct:.0f}%\n"
+                f"{mb_done:.1f} / {mb_total:.1f} MB\n"
+                f"Elapsed: {format_time(elapsed)}\n"
+                f"ETA: {format_time(eta)}\n"
+                f"Speed: {format_speed(speed)}"
+            )
+        else:
+            mb_done = current / (1024 * 1024)
+            text = (
+                f"{self.prefix}\n\n"
+                f"{mb_done:.1f} MB transferred\n"
+                f"Elapsed: {format_time(elapsed)}\n"
+                f"Speed: {format_speed(speed)}"
+            )
 
         if text == self._last_text:
             return
+
         try:
-            await self.status_msg.edit(text)
+            buttons = make_cancel_button(self.job_id)
+            await self.card_msg.edit(text, buttons=buttons)
             self._last_text = text
             self._last_update = now
         except Exception:
-            pass  # ignore flood waits / edit-unchanged errors
-
-
-def upload_to_youtube_with_progress(
-    path: str,
-    title: str,
-    description: str,
-    tags: list[str],
-    category: str,
-    progress_callback=None,
-) -> str:
-    """Upload a video to YouTube with chunked progress reporting."""
-    youtube = get_youtube()
-
-    all_tags = list(set(tags + default_tags))
-
-    body = {
-        "snippet": {
-            "title": title,
-            "description": description,
-            "categoryId": category,
-            "tags": all_tags if all_tags else None,
-        },
-        "status": {
-            "privacyStatus": privacy,
-            "selfDeclaredMadeForKids": False,
-        },
-    }
-
-    file_size = os.path.getsize(path)
-    chunk_size = 100 * 1024 * 1024  # 100 MB chunks for faster upload (was 8 MB)
-    media = MediaFileUpload(path, chunksize=chunk_size, resumable=True)
-    request = youtube.videos().insert(
-        part="snippet,status", body=body, media_body=media
-    )
-
-    response = None
-    bytes_sent = 0
-    while response is None:
-        status, response = request.next_chunk()
-        if status:
-            bytes_sent = int(status.resumable_progress)
-        else:
-            bytes_sent = file_size
-        if progress_callback:
-            progress_callback(bytes_sent, file_size)
-
-    return response["id"]
+            pass
 
 
 # ======================================================================
-#  Playlist helper
+#  Background tasks: Download & Upload
 # ======================================================================
 
-def add_to_playlist(video_id: str, playlist_id: str):
-    """Add a video to a YouTube playlist."""
-    youtube = get_youtube()
-    youtube.playlistItems().insert(
-        part="snippet",
-        body={
-            "snippet": {
-                "playlistId": playlist_id,
-                "resourceId": {
-                    "kind": "youtube#video",
-                    "videoId": video_id,
-                },
-            }
-        },
-    ).execute()
-    log.info(f"Added {video_id} to playlist {playlist_id}")
+async def start_download_task(job: JobState):
+    """Download the media stream and display progress on the card."""
+    state.active_job_id = job.id
+    job.status = "downloading"
+    tracker = ProgressTracker(job.card_msg, job.id, "⬇️ **Downloading…**")
+    await tracker.update(0, job.file_size, force=True)
 
+    tmp_dir = tempfile.mkdtemp(dir=DOWNLOAD_DIR)
+    job.tmp_dir = tmp_dir
+    dest_path = os.path.join(tmp_dir, job.filename or "video.mp4")
 
-# ======================================================================
-#  Thumbnail helper
-# ======================================================================
-
-def set_thumbnail(video_id: str, image_path: str):
-    """Upload a custom thumbnail for a video."""
-    youtube = get_youtube()
-    youtube.thumbnails().set(
-        videoId=video_id,
-        media_body=MediaFileUpload(image_path),
-    ).execute()
-    log.info(f"Set thumbnail for {video_id}")
-
-
-# ======================================================================
-#  Caption / subtitle upload helper
-# ======================================================================
-
-SUBTITLE_EXTENSIONS = {".srt", ".vtt", ".sbv", ".sub", ".ass", ".ssa", ".ttml"}
-
-
-def upload_captions(video_id: str, caption_path: str, language: str = "en", name: str = ""):
-    """Upload a caption/subtitle track to a YouTube video."""
-    youtube = get_youtube()
-    youtube.captions().insert(
-        part="snippet",
-        body={
-            "snippet": {
-                "videoId": video_id,
-                "language": language,
-                "name": name or Path(caption_path).stem,
-                "isDraft": False,
-            }
-        },
-        media_body=MediaFileUpload(caption_path),
-    ).execute()
-    log.info(f"Uploaded captions ({language}) for {video_id}")
-
-
-# ======================================================================
-#  Parallel download from Telegram
-# ======================================================================
-
-async def parallel_download(
-    tg_client: TelegramClient,
-    document,
-    dest_path: str,
-    file_size: int,
-    workers: int = PARALLEL_WORKERS,
-    progress_callback=None,
-):
-    """
-    Download a Telegram document using multiple parallel connections.
-    Each worker downloads non-overlapping chunks using iter_download
-    with offset/stride, and writes them directly to the target file.
-    """
-    from telethon.utils import get_input_location
-
-    dc_id, input_location = get_input_location(document)
-    chunk_size = PARALLEL_CHUNK  # 512KB per request
-    # Each worker's stride = workers * chunk_size (interleaved)
-    stride = workers * chunk_size
-
-    # Shared progress state
-    progress_lock = asyncio.Lock()
-    worker_bytes = [0] * workers
-
-    # Pre-allocate file so workers can open it in r+b mode and seek
-    with open(dest_path, "wb") as f:
-        if file_size > 0:
-            f.seek(file_size - 1)
-            f.write(b"\0")
-
-    async def _worker(worker_id: int):
-        """Download this worker's portion of the file."""
-        offset = worker_id * chunk_size
-        bytes_downloaded = 0
-        iteration = 0
-        # r+b allows writing to specific offsets without truncating
-        with open(dest_path, "r+b") as f:
-            async for chunk in tg_client.iter_download(
-                document,
-                offset=offset,
-                stride=stride,
-                request_size=chunk_size,
-                file_size=file_size,
-                dc_id=dc_id,
-            ):
-                write_offset = offset + iteration * stride
-                f.seek(write_offset)
-                f.write(chunk)
-                
-                bytes_downloaded += len(chunk)
-                iteration += 1
-                
-                if progress_callback:
-                    async with progress_lock:
-                        worker_bytes[worker_id] = bytes_downloaded
-                        total_done = sum(worker_bytes)
-                        await progress_callback(total_done, file_size)
-
-    tasks = []
-    for i in range(workers):
-        tasks.append(asyncio.create_task(_worker(i)))
+    async def dl_progress(received, total):
+        await tracker.update(received, total or job.file_size)
 
     try:
-        await asyncio.gather(*tasks)
-    except Exception:
-        # Cancel remaining tasks on failure
-        for t in tasks:
-            t.cancel()
-        raise
-    finally:
-        # Wait for cancellations to complete
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    log.info(
-        f"Parallel download complete: {file_size / (1024*1024):.1f} MB "
-        f"with {workers} workers"
-    )
-    return dest_path
-
-
-# ======================================================================
-#  Core upload flow
-# ======================================================================
-
-async def _do_upload(item: QueueItem):
-    """Download from Telegram, upload to YouTube with progress & retries."""
-    event = item.event
-    status = await event.reply("⬇️ Downloading…")
-    tmpdir = tempfile.mkdtemp()
-
-    try:
-        # ---- Download with progress ----
-        dl_tracker = ProgressTracker(status, "⬇️ Downloading…")
-        total_size = 0
-        if event.document:
-            total_size = event.document.size or 0
-
-        async def dl_progress(received, total):
-            await dl_tracker.update(received, total or total_size)
-
-        use_parallel = event.document and total_size > PARALLEL_THRESHOLD
-
-        if use_parallel:
-            # Determine filename from document attributes
-            filename = "video"
-            for attr in event.document.attributes:
-                if isinstance(attr, DocumentAttributeFilename):
-                    filename = attr.file_name
-                    break
-            dest_path = os.path.join(tmpdir, filename)
-            workers = min(PARALLEL_WORKERS, max(2, total_size // (50 * 1024 * 1024)))
-            await status.edit(f"⬇️ Downloading… ({workers} connections)")
-            dl_tracker = ProgressTracker(status, f"⬇️ Downloading… ({workers}x)")
-            path = await parallel_download(
-                tg_client=client,
-                document=event.document,
-                dest_path=dest_path,
-                file_size=total_size,
-                workers=workers,
-                progress_callback=dl_progress,
+        if job.source_type == "url":
+            path = await download_url_stream(
+                job.url,
+                dest_path,
+                job.file_size,
+                dl_progress,
+                job.cancel_event,
             )
         else:
-            path = await event.download_media(
-                file=tmpdir, progress_callback=dl_progress
+            path = await download_tg_video(
+                client,
+                job.tg_event,
+                dest_path,
+                job.file_size,
+                dl_progress,
+                job.cancel_event,
             )
-        await status.edit("⬆️ Uploading to YouTube…")
 
-        # ---- Upload with retry ----
-        video_id = None
-        last_error = None
-        loop = asyncio.get_running_loop()
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                ul_tracker = ProgressTracker(status, "⬆️ Uploading to YouTube…")
+        job.local_path = path
+        job.status = "downloaded"
+        if os.path.exists(path):
+            job.file_size = os.path.getsize(path)
 
-                def ul_progress(sent, total):
-                    asyncio.run_coroutine_threadsafe(
-                        ul_tracker.update(sent, total), loop
-                    )
+        ready_text = render_ready_card_text(job)
+        ready_buttons = make_ready_buttons(job.id, job.privacy)
+        await job.card_msg.edit(ready_text, buttons=ready_buttons)
 
-                video_id = await asyncio.to_thread(
-                    upload_to_youtube_with_progress,
-                    path,
-                    item.title,
-                    item.description,
-                    item.tags,
-                    item.category,
-                    ul_progress,
-                )
-                break
-            except Exception as e:
-                last_error = e
-                log.warning(f"Upload attempt {attempt}/{MAX_RETRIES} failed: {e}")
-                if attempt < MAX_RETRIES:
-                    await status.edit(
-                        f"⚠️ Attempt {attempt} failed, retrying in {RETRY_DELAY}s…\n{e}"
-                    )
-                    await asyncio.sleep(RETRY_DELAY)
+    except asyncio.CancelledError:
+        log.info(f"Download cancelled for job {job.id}")
+        job.cleanup()
+        if state.active_job_id == job.id:
+            state.active_job_id = None
+        await job.card_msg.edit(f"❌ Cancelled: **{job.title}**", buttons=None)
+    except Exception as exc:
+        log.error(f"Download failed for job {job.id}: {exc}", exc_info=True)
+        job.cleanup()
+        if state.active_job_id == job.id:
+            state.active_job_id = None
+        await job.card_msg.edit(f"❌ Download failed: {exc}", buttons=None)
 
-        if video_id is None:
-            raise last_error  # type: ignore
 
-        # ---- Playlist ----
-        playlist_id = item.playlist_id or default_playlist
+async def start_upload_task(job: JobState):
+    """Upload downloaded video to YouTube using resumable chunks."""
+    state.active_job_id = job.id
+    job.status = "uploading"
+    tracker = ProgressTracker(job.card_msg, job.id, "⬆️ **Uploading to YouTube…**")
+    await tracker.update(0, job.file_size, force=True)
+
+    loop = asyncio.get_running_loop()
+
+    def ul_progress(sent, total):
+        asyncio.run_coroutine_threadsafe(tracker.update(sent, total), loop)
+
+    def cancel_check():
+        return job.cancel_event.is_set()
+
+    try:
+        video_id = await asyncio.to_thread(
+            upload_to_youtube_with_progress,
+            job.local_path,
+            job.title,
+            job.description,
+            job.tags,
+            job.category,
+            job.privacy,
+            ul_progress,
+            cancel_check,
+        )
+
         playlist_note = ""
+        playlist_id = job.playlist_id or state.default_playlist
         if playlist_id:
             try:
                 await asyncio.to_thread(add_to_playlist, video_id, playlist_id)
-                playlist_note = f"\n📂 Added to playlist"
+                playlist_note = "\n📂 Added to playlist"
             except Exception as e:
                 playlist_note = f"\n⚠️ Playlist failed: {e}"
 
-        # ---- Store pending thumbnail state ----
-        pending_thumbnail[event.chat_id] = video_id
-
-        # ---- Save history ----
         save_history({
             "video_id": video_id,
-            "title": item.title,
-            "privacy": privacy,
+            "title": job.title,
+            "privacy": job.privacy,
             "uploaded_at": datetime.now().isoformat(),
         })
 
+        state.pending_thumbnail[job.chat_id] = video_id
         url = f"https://youtu.be/{video_id}"
-        await status.edit(
-            f"✅ Done ({privacy})\n{url}{playlist_note}"
-            f"\n\n💡 Reply with a photo to set thumbnail"
-            f"\n💡 Reply with .srt/.vtt file to add captions"
+        await job.card_msg.edit(
+            f"✅ **Uploaded successfully!**\n\n"
+            f"🔗 {url}\n"
+            f"**Title:** {job.title}\n"
+            f"**Privacy:** {job.privacy}{playlist_note}\n\n"
+            f"💡 Reply with a photo to set thumbnail\n"
+            f"💡 Reply with .srt/.vtt file to add captions",
+            buttons=None,
         )
-        log.info(f"Uploaded: {item.title} → {url}")
+        job.status = "done"
 
+    except asyncio.CancelledError:
+        log.info(f"Upload cancelled for job {job.id}")
+        await job.card_msg.edit(f"❌ Cancelled: **{job.title}**", buttons=None)
     except Exception as exc:
-        await status.edit(f"❌ Failed after {MAX_RETRIES} attempts: {exc}")
-        log.error(f"Upload failed: {exc}", exc_info=True)
+        log.error(f"Upload failed for job {job.id}: {exc}", exc_info=True)
+        await job.card_msg.edit(f"❌ Upload failed: {exc}", buttons=None)
     finally:
-        # Cleanup temp files
-        for name in os.listdir(tmpdir):
-            os.remove(os.path.join(tmpdir, name))
-        os.rmdir(tmpdir)
+        job.cleanup()
+        if state.active_job_id == job.id:
+            state.active_job_id = None
 
 
 # ======================================================================
-#  Event handlers
+#  Caption parser
 # ======================================================================
+
+def parse_caption(raw_text: str) -> tuple[str, str, list[str]]:
+    text = (raw_text or "").strip()
+    if not text:
+        return "", "", []
+
+    lines = text.split("\n")
+    title = lines[0].strip()
+    rest = "\n".join(lines[1:]).strip()
+
+    tag_pattern = re.compile(r"#(\w+)")
+    inline_tags = tag_pattern.findall(rest)
+    desc_lines = [l for l in rest.split("\n") if not l.strip().startswith("#")]
+    description = "\n".join(desc_lines).strip()
+
+    return title[:100], description, inline_tags
+
+
+# ======================================================================
+#  Event Handlers: Callbacks & Messages
+# ======================================================================
+
+@client.on(events.CallbackQuery)
+async def handle_callback(event):
+    if event.sender_id != OWNER_ID:
+        return
+
+    data = event.data.decode("utf-8") if isinstance(event.data, bytes) else str(event.data)
+    if ":" not in data:
+        return
+
+    action, job_id = data.split(":", 1)
+    job = get_job(job_id)
+    if not job:
+        await event.answer("⚠️ Job not found or expired.", alert=True)
+        return
+
+    if action == "cancel":
+        job.cancel_event.set()
+        job.cleanup()
+        if state.active_job_id == job.id:
+            state.active_job_id = None
+        job.status = "cancelled"
+        try:
+            await event.edit(f"❌ Cancelled: **{job.title}**", buttons=None)
+        except Exception:
+            pass
+        await event.answer("Cancelled.")
+        return
+
+    elif action == "dl":
+        if state.active_job_id is not None and state.active_job_id != job.id:
+            await event.answer("⚠️ Another job is currently active. Finish or cancel it first.", alert=True)
+            return
+        await event.answer("Starting download…")
+        asyncio.create_task(start_download_task(job))
+
+    elif action == "title":
+        job.waiting_for_title = True
+        await event.answer("Send the new title in your next message.")
+        ready_text = render_ready_card_text(job)
+        ready_buttons = make_ready_buttons(job.id, job.privacy)
+        await event.edit(ready_text, buttons=ready_buttons)
+
+    elif action == "priv":
+        cycle = ["private", "unlisted", "public"]
+        cur_idx = cycle.index(job.privacy) if job.privacy in cycle else 0
+        job.privacy = cycle[(cur_idx + 1) % len(cycle)]
+        await event.answer(f"Privacy set to {job.privacy}")
+        ready_text = render_ready_card_text(job)
+        ready_buttons = make_ready_buttons(job.id, job.privacy)
+        await event.edit(ready_text, buttons=ready_buttons)
+
+    elif action == "up":
+        if state.active_job_id is not None and state.active_job_id != job.id:
+            await event.answer("⚠️ Another job is currently active. Finish or cancel it first.", alert=True)
+            return
+        if not job.local_path or not os.path.exists(job.local_path):
+            await event.answer("⚠️ File not found locally. Please re-download.", alert=True)
+            return
+        await event.answer("Starting upload…")
+        asyncio.create_task(start_upload_task(job))
+
+
+@client.on(events.NewMessage(from_users=OWNER_ID))
+async def handle_message(event):
+    if event.sender_id != OWNER_ID:
+        return
+
+    # Check if user is replying with a new title for an active job
+    waiting_job = get_waiting_title_job(event.chat_id)
+    if waiting_job and event.raw_text:
+        new_title = event.raw_text.strip()[:100]
+        if new_title:
+            waiting_job.title = new_title
+            waiting_job.waiting_for_title = False
+            ready_text = render_ready_card_text(waiting_job)
+            ready_buttons = make_ready_buttons(waiting_job.id, waiting_job.privacy)
+            if waiting_job.card_msg:
+                try:
+                    await waiting_job.card_msg.edit(ready_text, buttons=ready_buttons)
+                except Exception:
+                    pass
+            await event.reply(f"✅ Title updated to:\n`{new_title}`")
+            return
+
+    text = (event.raw_text or "").strip()
+    if text.startswith("/"):
+        return
+
+    # Check for direct URL
+    url = extract_url(text)
+    if url:
+        allowed, err = is_host_allowed(url)
+        if not allowed:
+            await event.reply(f"❌ {err}")
+            return
+
+        status_msg = await event.reply("🔍 Inspecting URL…")
+        try:
+            final_url, filename, size = await inspect_url(url)
+            title = clean_title(filename)
+            job = create_job(
+                chat_id=event.chat_id,
+                source_type="url",
+                title=title,
+                file_size=size,
+                filename=filename,
+                url=final_url,
+            )
+            job.card_msg = status_msg
+
+            preview_text = (
+                f"📹 **Video Found**\n\n"
+                f"**Title:** {job.title}\n"
+                f"**Size:** {format_size(job.file_size)}"
+            )
+            buttons = make_preview_buttons(job.id)
+            await status_msg.edit(preview_text, buttons=buttons)
+        except Exception as exc:
+            await status_msg.edit(f"❌ Error: {exc}")
+        return
+
 
 def is_video(e) -> bool:
     if e.video:
@@ -600,47 +457,69 @@ def is_video(e) -> bool:
     return bool(doc and (doc.mime_type or "").startswith("video/"))
 
 
-def is_photo(e) -> bool:
-    return bool(e.photo)
-
-
-def is_subtitle_file(e) -> bool:
-    """Check if the message contains a subtitle file."""
-    if not e.document:
-        return False
-    for attr in e.document.attributes:
-        if isinstance(attr, DocumentAttributeFilename):
-            ext = Path(attr.file_name).suffix.lower()
-            return ext in SUBTITLE_EXTENSIONS
-    return False
-
-
 @client.on(events.NewMessage(from_users=OWNER_ID, func=is_video))
 async def handle_video(event):
-    title, description, tags = parse_caption(event.raw_text)
-    item = QueueItem(
-        event=event,
+    if event.sender_id != OWNER_ID:
+        return
+
+    total_size = 0
+    if event.document:
+        total_size = event.document.size or 0
+    elif event.video:
+        total_size = event.video.size or 0
+
+    max_bytes = int(MAX_DOWNLOAD_GB * 1024 * 1024 * 1024)
+    if total_size > max_bytes:
+        await event.reply(
+            f"❌ File size ({format_size(total_size)}) exceeds MAX_DOWNLOAD_GB ({MAX_DOWNLOAD_GB} GB)"
+        )
+        return
+
+    try:
+        check_disk_space(total_size)
+    except OSError as e:
+        await event.reply(f"❌ {e}")
+        return
+
+    filename = "video.mp4"
+    if event.document and event.document.attributes:
+        for attr in event.document.attributes:
+            if isinstance(attr, DocumentAttributeFilename):
+                filename = attr.file_name
+                break
+
+    caption_title, desc, tags = parse_caption(event.raw_text)
+    title = caption_title if caption_title else clean_title(filename)
+
+    status_msg = await event.reply("📹 **Video Received**…")
+    job = create_job(
+        chat_id=event.chat_id,
+        source_type="telegram",
         title=title,
-        description=description,
+        file_size=total_size,
+        filename=filename,
+        tg_event=event,
+        description=desc,
         tags=tags,
-        category=default_category,
-        playlist_id=default_playlist,
     )
-    upload_queue.append(item)
-    pos = len(upload_queue)
-    if pos > 1:
-        await event.reply(f"📋 Queued at position {pos}")
-    asyncio.create_task(process_queue())
+    job.card_msg = status_msg
+
+    preview_text = (
+        f"📹 **Video Received**\n\n"
+        f"**Title:** {job.title}\n"
+        f"**Size:** {format_size(job.file_size)}"
+    )
+    buttons = make_preview_buttons(job.id)
+    await status_msg.edit(preview_text, buttons=buttons)
 
 
-@client.on(events.NewMessage(from_users=OWNER_ID, func=is_photo))
+@client.on(events.NewMessage(from_users=OWNER_ID, func=lambda e: bool(e.photo)))
 async def handle_thumbnail(event):
-    """Set thumbnail if there's a pending video."""
-    video_id = pending_thumbnail.pop(event.chat_id, None)
+    video_id = state.pending_thumbnail.pop(event.chat_id, None)
     if not video_id:
         return
     status = await event.reply("🖼️ Setting thumbnail…")
-    tmpdir = tempfile.mkdtemp()
+    tmpdir = tempfile.mkdtemp(dir=DOWNLOAD_DIR)
     try:
         path = await event.download_media(file=tmpdir)
         await asyncio.to_thread(set_thumbnail, video_id, path)
@@ -653,19 +532,29 @@ async def handle_thumbnail(event):
         os.rmdir(tmpdir)
 
 
+SUBTITLE_EXTENSIONS = {".srt", ".vtt", ".sbv", ".sub", ".ass", ".ssa", ".ttml"}
+
+
+def is_subtitle_file(e) -> bool:
+    if not e.document:
+        return False
+    for attr in e.document.attributes:
+        if isinstance(attr, DocumentAttributeFilename):
+            ext = Path(attr.file_name).suffix.lower()
+            return ext in SUBTITLE_EXTENSIONS
+    return False
+
+
 @client.on(events.NewMessage(from_users=OWNER_ID, func=is_subtitle_file))
 async def handle_subtitle(event):
-    """Upload captions/subtitles to the most recent video."""
-    video_id = pending_thumbnail.get(event.chat_id)
+    video_id = state.pending_thumbnail.get(event.chat_id)
     if not video_id:
         await event.reply("❌ No recent video to attach captions to.")
         return
 
-    # Parse language from caption, e.g. "en" or "bn"
     lang = (event.raw_text or "").strip() or "en"
-
     status = await event.reply(f"📝 Uploading captions ({lang})…")
-    tmpdir = tempfile.mkdtemp()
+    tmpdir = tempfile.mkdtemp(dir=DOWNLOAD_DIR)
     try:
         path = await event.download_media(file=tmpdir)
         await asyncio.to_thread(upload_captions, video_id, path, lang)
@@ -678,16 +567,16 @@ async def handle_subtitle(event):
         os.rmdir(tmpdir)
 
 
-# ---- Commands ----
+# ======================================================================
+#  Commands
+# ======================================================================
 
 @client.on(events.NewMessage(from_users=OWNER_ID, pattern=r"/start"))
 async def cmd_start(event):
     await event.reply(
         "🎬 **YouTube Upload Bot**\n\n"
-        "**Send a video** to upload it. Caption format:\n"
-        "`Title goes here`\n"
-        "`Description on next lines`\n"
-        "`#tag1 #tag2`\n\n"
+        "• **Send a direct link** (HTTPS from allowed domain) to inspect and upload.\n"
+        "• **Send a video file** directly to inspect and upload.\n\n"
         "**Commands:**\n"
         "/privacy `private|unlisted|public`\n"
         "/tags `tag1, tag2, …` — set default tags\n"
@@ -695,7 +584,7 @@ async def cmd_start(event):
         "/playlist `PLAYLIST_ID` — auto-add to playlist\n"
         "/playlist off — disable auto-playlist\n"
         "/history — recent uploads\n"
-        "/queue — show queue status\n"
+        "/queue — current active job status\n"
         "/help — show this message"
     )
 
@@ -707,77 +596,74 @@ async def cmd_help(event):
 
 @client.on(events.NewMessage(from_users=OWNER_ID, pattern=r"/privacy\s*(.*)"))
 async def cmd_privacy(event):
-    global privacy
     arg = event.pattern_match.group(1).strip().lower()
     if arg not in ("private", "unlisted", "public"):
         await event.reply(
-            f"Current: **{privacy}**\n"
+            f"Current default: **{state.PRIVACY}**\n"
             "Usage: `/privacy private|unlisted|public`"
         )
         return
-    privacy = arg
-    await event.reply(f"✅ Privacy set to **{privacy}**")
-    log.info(f"Privacy changed to {privacy}")
+    state.PRIVACY = arg
+    await event.reply(f"✅ Default privacy set to **{state.PRIVACY}**")
 
 
 @client.on(events.NewMessage(from_users=OWNER_ID, pattern=r"/tags\s*(.*)"))
 async def cmd_tags(event):
-    global default_tags
     arg = event.pattern_match.group(1).strip()
     if not arg:
-        current = ", ".join(default_tags) if default_tags else "none"
+        current = ", ".join(state.default_tags) if state.default_tags else "none"
         await event.reply(f"Current default tags: {current}\nUsage: `/tags tag1, tag2`")
         return
-    default_tags = [t.strip().lstrip("#") for t in arg.split(",") if t.strip()]
-    await event.reply(f"✅ Default tags: {', '.join(default_tags)}")
+    state.default_tags = [t.strip().lstrip("#") for t in arg.split(",") if t.strip()]
+    await event.reply(f"✅ Default tags: {', '.join(state.default_tags)}")
 
 
 @client.on(events.NewMessage(from_users=OWNER_ID, pattern=r"/category\s*(.*)"))
 async def cmd_category(event):
-    global default_category
     arg = event.pattern_match.group(1).strip()
     if not arg or arg not in CATEGORY_MAP:
         lines = "\n".join(f"`{k}` — {v}" for k, v in sorted(CATEGORY_MAP.items(), key=lambda x: int(x[0])))
         await event.reply(
-            f"Current: **{default_category}** ({CATEGORY_MAP.get(default_category, '?')})\n\n"
+            f"Current: **{state.default_category}** ({CATEGORY_MAP.get(state.default_category, '?')})\n\n"
             f"**Categories:**\n{lines}\n\nUsage: `/category 22`"
         )
         return
-    default_category = arg
+    state.default_category = arg
     await event.reply(f"✅ Category: **{arg}** ({CATEGORY_MAP[arg]})")
 
 
 @client.on(events.NewMessage(from_users=OWNER_ID, pattern=r"/playlist\s*(.*)"))
 async def cmd_playlist(event):
-    global default_playlist
     arg = event.pattern_match.group(1).strip()
     if not arg:
-        current = default_playlist or "none"
+        current = state.default_playlist or "none"
         await event.reply(
             f"Current playlist: `{current}`\n"
             "Usage: `/playlist PLAYLIST_ID` or `/playlist off`"
         )
         return
     if arg.lower() == "off":
-        default_playlist = None
+        state.default_playlist = None
         await event.reply("✅ Auto-playlist disabled")
     else:
-        default_playlist = arg
+        state.default_playlist = arg
         await event.reply(f"✅ Auto-playlist: `{arg}`")
 
 
 @client.on(events.NewMessage(from_users=OWNER_ID, pattern=r"/history"))
 async def cmd_history(event):
-    if not Path(HISTORY_FILE).exists():
+    hist_path = Path(state.HISTORY_FILE)
+    if not hist_path.exists():
         await event.reply("No uploads yet.")
         return
     try:
-        history = json.loads(Path(HISTORY_FILE).read_text())
+        import json
+        history = json.loads(hist_path.read_text())
     except (json.JSONDecodeError, OSError):
         await event.reply("No uploads yet.")
         return
 
-    recent = history[-10:]  # last 10
+    recent = history[-10:]
     lines = []
     for i, h in enumerate(reversed(recent), 1):
         title = h.get("title", "?")
@@ -791,15 +677,17 @@ async def cmd_history(event):
 
 @client.on(events.NewMessage(from_users=OWNER_ID, pattern=r"/queue"))
 async def cmd_queue(event):
-    if not upload_queue:
-        await event.reply("📋 Queue is empty.")
+    if state.active_job_id:
+        active = get_job(state.active_job_id)
+        title = active.title if active else state.active_job_id
+        status = active.status if active else "running"
+        await event.reply(f"📋 **Active job:** {title} ({status})")
     else:
-        lines = [f"{i+1}. {item.title}" for i, item in enumerate(upload_queue)]
-        await event.reply("📋 **Upload Queue:**\n\n" + "\n".join(lines))
+        await event.reply("📋 No active job.")
 
 
 # ======================================================================
-#  Main
+#  Main entrypoint
 # ======================================================================
 
 if __name__ == "__main__":
